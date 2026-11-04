@@ -102,8 +102,8 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 #define VIP_FREEZE_MAX_RETRIES      3
 #define VIP_FREEZE_FLOW_FRAMES      100
 
-// Input re-sync: mainloop iterations to keep VIP disabled before input re-initialization (as when switching via test pattern)
-#define RESYNC_VIP_OFF_ITERS        50
+// Input re-sync: mainloop iterations to stay in test pattern before switching back to the original input
+#define RESYNC_TP_ITERS             100
 
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
 #define SI_PLL_WDOG_POLL_INTERVAL   10
@@ -207,11 +207,10 @@ int enable_isl, enable_hdmirx, enable_sdp, enable_tp;
 oper_mode_t oper_mode;
 
 avinput_t avinput, target_avinput;
-int force_input_reinit;
-int vip_force_off;
-int resync_ctr;
+int resync_ctr, resync_returning;
+avinput_t resync_return_input;
 unsigned resync_count;
-unsigned pll_reset_count;
+unsigned pll_lol_count;
 uint8_t pll_last_status;
 
 mode_data_t vmode_in, vmode_out;
@@ -474,7 +473,7 @@ void update_sc_config()
     sl_config4_reg sl_config4 = {.data=0x00000000};
 
 #ifdef VIP
-    vip_enable = !enable_tp && !vip_force_off && (avconfig->oper_mode == 1);
+    vip_enable = !enable_tp && (avconfig->oper_mode == 1);
 
 #ifdef DEBUG
     dil_visualize_motion = avconfig->scl_dil_visualize_motion;
@@ -873,24 +872,24 @@ int vip_freeze_wdog_update() {
 }
 #endif
 
-// Start re-sync of current input: keep VIP fully disabled for a while and then re-initialize input,
-// which mimics switching away to test pattern and back
+// Start re-sync of current input by switching to test pattern and back after a while. Test pattern mode disables VIP
+// and drives the pixel clock from XTAL, so VIP clocks keep running while the pipeline stops (unlike when input is lost).
 void start_input_resync() {
     if (enable_tp || (resync_ctr > 0))
         return;
 
-    printf("Re-syncing current input\n");
+    printf("Re-syncing current input via test pattern\n");
     resync_count++;
-    resync_ctr = RESYNC_VIP_OFF_ITERS;
+    resync_return_input = avinput;
+    target_avinput = AV_TESTPAT;
+    resync_ctr = RESYNC_TP_ITERS;
 #ifdef VIP
     freeze_ctr = 0;
-    vip_force_off = 1;
-    update_sc_config();
-    vip_dil_hard_reset();
 #endif
 }
 
-// Reset pixel clock PLL if it does not regain lock (e.g. after input clock was disrupted during source mode change)
+// Monitor pixel clock PLL lock. Observe only: resetting PLLA under a live pixel clock interrupts the CVO / HDMI TX
+// clock domain, which may stall the scaler. Counts sustained loss-of-lock events for diagnostics.
 int si_pll_wdog_update(uint8_t clkin_src) {
     static uint8_t poll_ctr = 0;
     static uint8_t unlock_ctr = 0;
@@ -909,16 +908,15 @@ int si_pll_wdog_update(uint8_t clkin_src) {
     status = si5351_get_status(&si_dev);
     pll_last_status = status;
 
-    // Reset does not help if PLL reference clock is missing
+    // Ignore loss of lock caused by missing PLL reference clock
     if ((status & SI_STATUS_LOL_A) && !(clkin_src && (status & SI_STATUS_LOS_CLKIN)))
         unlock_ctr++;
     else
         unlock_ctr = 0;
 
     if (unlock_ctr >= SI_PLL_WDOG_VALUE) {
-        printf("Resetting Si5351 PLLA due to loss of lock (status 0x%.2x)\n", status);
-        si5351_force_pll_reset(&si_dev, SI_PLLA);
-        pll_reset_count++;
+        printf("Si5351 PLLA loss of lock (status 0x%.2x)\n", status);
+        pll_lol_count++;
         unlock_ctr = 0;
         holdoff_ctr = SI_PLL_WDOG_HOLDOFF;
         return 1;
@@ -1357,13 +1355,16 @@ void print_vm_stats(int menu_mode) {
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "C%lx F%lu", vip_cvi->status, vip_fb->frame_cnt);
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler out:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "V%lx O%lx D%lu", vip_fb->status, vip_cvo->status, vip_fb->drop_rpt_cnt);
+        // Live CVI overflow and CVO underflow flags from sys_status[31:30]
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "In ovf/out udf:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%lu %lu", (IORD_ALTERA_AVALON_PIO_DATA(PIO_2_BASE) >> 31) & 0x1, (IORD_ALTERA_AVALON_PIO_DATA(PIO_2_BASE) >> 30) & 0x1);
     }
 #endif
     if (!enable_tp) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u", resync_count);
-        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "PLL resets:");
-        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (st %.2x)", pll_reset_count, pll_last_status);
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "PLL LOL events:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (st %.2x)", pll_lol_count, pll_last_status);
     }
     // SDP diagnostics: status registers 1, 2 and 3
     if (enable_sdp && advsdp_dev_avail) {
@@ -1515,26 +1516,19 @@ void mainloop()
         if (!sys_powered_on)
             break;
 
-        // Finish input re-sync after VIP has been disabled long enough
-        if ((resync_ctr > 0) && (--resync_ctr == 0)) {
-            vip_force_off = 0;
-            force_input_reinit = 1;
+        // Finish input re-sync by returning from test pattern, unless another input was selected meanwhile
+        if ((resync_ctr > 0) && (--resync_ctr == 0) && (target_avinput == AV_TESTPAT)) {
+            target_avinput = resync_return_input;
+            resync_returning = 1;
         }
 
-        if ((target_avinput != avinput) || force_input_reinit) {
-            if (force_input_reinit) {
-                // Power-cycle receivers so that they re-acquire sync from scratch (as when switching via another input)
-                adv761x_enable_power(&advrx_dev, 0);
-                adv7280a_enable_power(&advsdp_dev, 0);
-                advsdp_dev.sync_active = 0;
-                usleep(20000);
-                force_input_reinit = 0;
-            }
+        if (target_avinput != avinput) {
 #ifdef VIP
-            // Allow freeze watchdog retries again on input change and on powerup
-            if (target_avinput != avinput)
+            // Allow freeze watchdog retries again on input change and on powerup, but not within a re-sync round trip
+            if ((resync_ctr == 0) && !resync_returning)
                 freeze_retries = 0;
 #endif
+            resync_returning = 0;
 
             // Force pixel clock PLL reset and full HDMI TX mode setup on next mode change
             si5351_invalidate_pll(&si_dev, SI_PLLA);
