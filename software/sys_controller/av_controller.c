@@ -96,6 +96,11 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 
 #define VIP_WDOG_VALUE 10
 
+// Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
+#define SI_PLL_WDOG_POLL_INTERVAL   10
+#define SI_PLL_WDOG_VALUE           3
+#define SI_PLL_WDOG_HOLDOFF         20
+
 // Default settings
 const settings_t ts_default = {
     .default_avinput = 0,
@@ -193,6 +198,7 @@ int enable_isl, enable_hdmirx, enable_sdp, enable_tp;
 oper_mode_t oper_mode;
 
 avinput_t avinput, target_avinput;
+int force_input_reinit;
 
 mode_data_t vmode_in, vmode_out;
 vm_proc_config_t vm_conf;
@@ -810,6 +816,41 @@ int vip_wdog_update(uint8_t framelock) {
 }
 #endif
 
+// Reset pixel clock PLL if it does not regain lock (e.g. after input clock was disrupted during source mode change)
+int si_pll_wdog_update(uint8_t clkin_src) {
+    static uint8_t poll_ctr = 0;
+    static uint8_t unlock_ctr = 0;
+    static uint8_t holdoff_ctr = 0;
+    uint8_t status;
+
+    if (++poll_ctr < SI_PLL_WDOG_POLL_INTERVAL)
+        return 0;
+    poll_ctr = 0;
+
+    if (holdoff_ctr > 0) {
+        holdoff_ctr--;
+        return 0;
+    }
+
+    status = si5351_get_status(&si_dev);
+
+    // Reset does not help if PLL reference clock is missing
+    if ((status & SI_STATUS_LOL_A) && !(clkin_src && (status & SI_STATUS_LOS_CLKIN)))
+        unlock_ctr++;
+    else
+        unlock_ctr = 0;
+
+    if (unlock_ctr >= SI_PLL_WDOG_VALUE) {
+        printf("Resetting Si5351 PLLA due to loss of lock (status 0x%.2x)\n", status);
+        si5351_force_pll_reset(&si_dev, SI_PLLA);
+        unlock_ctr = 0;
+        holdoff_ctr = SI_PLL_WDOG_HOLDOFF;
+        return 1;
+    }
+
+    return 0;
+}
+
 int init_emif()
 {
     alt_timestamp_type start_ts;
@@ -1085,6 +1126,12 @@ void switch_input(rc_code_t rcode, btn_code_t bcode) {
         target_avinput = prev_input;
     else if (bcode == BC_DOWN)
         target_avinput = next_input;
+
+    // Re-initialize current input if its dedicated button is pressed again
+    if (((rcode == RC_BTN1) || (rcode == RC_BTN5) || (rcode == RC_BTN6)) && (target_avinput == avinput)) {
+        printf("Re-initializing current input\n");
+        force_input_reinit = 1;
+    }
 }
 
 void set_syncmux_biasmode(uint8_t syncmux_stc) {
@@ -1374,7 +1421,14 @@ void mainloop()
         if (!sys_powered_on)
             break;
 
-        if (target_avinput != avinput) {
+        if ((target_avinput != avinput) || force_input_reinit) {
+            force_input_reinit = 0;
+
+            // Force pixel clock PLL reset and full HDMI TX mode setup on next mode change
+            si5351_invalidate_pll(&si_dev, SI_PLLA);
+#ifdef INC_SII1136
+            siitx_dev.pclk_hz = 0;
+#endif
 
             // defaults
             enable_isl = 1;
@@ -1564,6 +1618,7 @@ void mainloop()
                 if (isl_dev.sync_active) {
                     isl_enable_power(&isl_dev, 1);
                     isl_enable_outputs(&isl_dev, 1);
+                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("ISL51002 sync up\n");
                 } else {
                     isl_enable_power(&isl_dev, 0);
@@ -1701,6 +1756,7 @@ void mainloop()
         } else if (enable_hdmirx) {
             if (adv761x_check_activity(&advrx_dev)) {
                 if (advrx_dev.sync_active) {
+                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("adv sync up\n");
                 } else {
                     strlcpy(row1, avinput_str[avinput], US2066_ROW_LEN+1);
@@ -1826,6 +1882,7 @@ void mainloop()
         } else if (enable_sdp) {
             if (adv7280a_check_activity(&advsdp_dev)) {
                 if (advsdp_dev.sync_active) {
+                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("SDP sync up\n");
                 } else {
                     strlcpy(row1, avinput_str[avinput], US2066_ROW_LEN+1);
@@ -1934,6 +1991,11 @@ void mainloop()
         si2177_update_config(&sirf_dev, &cur_avconfig->sirf_cfg);
 
         pcm186x_update_config(&pcm_dev, &cur_avconfig->pcm_cfg);
+
+        // Monitor pixel clock PLL lock (si_pclk_mult of 1 or below bypasses PLLA)
+        if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) &&
+            (oper_mode != OPERMODE_INVALID) && ((vm_conf.si_pclk_mult == 0) || (vm_conf.si_pclk_mult > 1)))
+            si_pll_wdog_update(vm_conf.framelock);
 
 #ifdef VIP
         // Monitor if VIP DIL gets stuck or CVO fails framelocking
