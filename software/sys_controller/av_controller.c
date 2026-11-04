@@ -211,6 +211,8 @@ int force_input_reinit;
 int vip_force_off;
 int resync_ctr;
 unsigned resync_count;
+unsigned pll_reset_count;
+uint8_t pll_last_status;
 
 mode_data_t vmode_in, vmode_out;
 vm_proc_config_t vm_conf;
@@ -839,11 +841,11 @@ void vip_stop() {
 }
 
 static uint8_t freeze_ctr = 0;
+static uint8_t freeze_retries = 0;
 
 // Detect frozen scaler input (frame buffer receives no new frames while input sync is active).
 // Unlike vip_wdog_update(), this does not depend on CVI status which may not report a valid input in this state.
 int vip_freeze_wdog_update() {
-    static uint8_t retries = 0;
     static uint8_t flow_ctr = 0;
     static uint32_t frame_cnt_prev = 0;
     uint32_t frame_cnt = vip_fb->frame_cnt;
@@ -853,8 +855,8 @@ int vip_freeze_wdog_update() {
         if (flow_ctr < VIP_FREEZE_FLOW_FRAMES)
             flow_ctr++;
         else
-            retries = 0;
-    } else if (retries < VIP_FREEZE_MAX_RETRIES) {
+            freeze_retries = 0;
+    } else if (freeze_retries < VIP_FREEZE_MAX_RETRIES) {
         freeze_ctr++;
     }
     frame_cnt_prev = frame_cnt;
@@ -863,7 +865,7 @@ int vip_freeze_wdog_update() {
         printf("Scaler input frozen (CVI status 0x%lx), re-initializing input\n", vip_cvi->status);
         freeze_ctr = 0;
         flow_ctr = 0;
-        retries++;
+        freeze_retries++;
         return 1;
     }
 
@@ -905,6 +907,7 @@ int si_pll_wdog_update(uint8_t clkin_src) {
     }
 
     status = si5351_get_status(&si_dev);
+    pll_last_status = status;
 
     // Reset does not help if PLL reference clock is missing
     if ((status & SI_STATUS_LOL_A) && !(clkin_src && (status & SI_STATUS_LOS_CLKIN)))
@@ -915,6 +918,7 @@ int si_pll_wdog_update(uint8_t clkin_src) {
     if (unlock_ctr >= SI_PLL_WDOG_VALUE) {
         printf("Resetting Si5351 PLLA due to loss of lock (status 0x%.2x)\n", status);
         si5351_force_pll_reset(&si_dev, SI_PLLA);
+        pll_reset_count++;
         unlock_ctr = 0;
         holdoff_ctr = SI_PLL_WDOG_HOLDOFF;
         return 1;
@@ -1358,6 +1362,8 @@ void print_vm_stats(int menu_mode) {
     if (!enable_tp) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u", resync_count);
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "PLL resets:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (st %.2x)", pll_reset_count, pll_last_status);
     }
     // SDP diagnostics: status registers 1, 2 and 3
     if (enable_sdp && advsdp_dev_avail) {
@@ -1524,6 +1530,11 @@ void mainloop()
                 usleep(20000);
                 force_input_reinit = 0;
             }
+#ifdef VIP
+            // Allow freeze watchdog retries again on input change and on powerup
+            if (target_avinput != avinput)
+                freeze_retries = 0;
+#endif
 
             // Force pixel clock PLL reset and full HDMI TX mode setup on next mode change
             si5351_invalidate_pll(&si_dev, SI_PLLA);
