@@ -211,6 +211,7 @@ int resync_ctr, resync_returning;
 avinput_t resync_return_input;
 unsigned resync_count;
 unsigned pll_lol_count;
+unsigned vip_route_changes;
 uint8_t pll_last_status;
 
 mode_data_t vmode_in, vmode_out;
@@ -689,6 +690,7 @@ void update_sc_config()
         vip_swi_pre_dil->dout_ctrl[0] = !vm_in->timings.interlaced;
         vip_swi_pre_dil->dout_ctrl[1] = vm_in->timings.interlaced;
         vip_swi_pre_dil->out_switch = 1;
+        vip_route_changes++;
     }
 
     if (vip_swi_post_dil->dout_ctrl[0] != 1<<(vm_in->timings.interlaced)) {
@@ -1358,11 +1360,16 @@ void print_vm_stats(int menu_mode) {
         // Live CVI overflow and CVO underflow flags from sys_status[31:30]
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "In ovf/out udf:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%lu %lu", (IORD_ALTERA_AVALON_PIO_DATA(PIO_2_BASE) >> 31) & 0x1, (IORD_ALTERA_AVALON_PIO_DATA(PIO_2_BASE) >> 30) & 0x1);
+        // Switch status, pending output switch and routing; DIL status
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "SWI0 st/sw/rt:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%lx %lx %lx%lx", vip_swi_pre_dil->status, vip_swi_pre_dil->out_switch, vip_swi_pre_dil->dout_ctrl[0], vip_swi_pre_dil->dout_ctrl[1]);
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "SWI1 st/sw/rt:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%lx %lx %lx DIL%lx", vip_swi_post_dil->status, vip_swi_post_dil->out_switch, vip_swi_post_dil->dout_ctrl[0], vip_dil->status);
     }
 #endif
     if (!enable_tp) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
-        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u", resync_count);
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (routes %u)", resync_count, vip_route_changes);
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "PLL LOL events:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (st %.2x)", pll_lol_count, pll_last_status);
     }
@@ -1724,7 +1731,6 @@ void mainloop()
                 if (isl_dev.sync_active) {
                     isl_enable_power(&isl_dev, 1);
                     isl_enable_outputs(&isl_dev, 1);
-                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("ISL51002 sync up\n");
                 } else {
                     isl_enable_power(&isl_dev, 0);
@@ -1862,7 +1868,6 @@ void mainloop()
         } else if (enable_hdmirx) {
             if (adv761x_check_activity(&advrx_dev)) {
                 if (advrx_dev.sync_active) {
-                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("adv sync up\n");
                 } else {
                     strlcpy(row1, avinput_str[avinput], US2066_ROW_LEN+1);
@@ -1988,7 +1993,6 @@ void mainloop()
         } else if (enable_sdp) {
             if (adv7280a_check_activity(&advsdp_dev)) {
                 if (advsdp_dev.sync_active) {
-                    si5351_invalidate_pll(&si_dev, SI_PLLA);
                     printf("SDP sync up\n");
                 } else {
                     strlcpy(row1, avinput_str[avinput], US2066_ROW_LEN+1);
