@@ -96,6 +96,12 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 
 #define VIP_WDOG_VALUE 10
 
+// Scaler input freeze watchdog: mainloop iterations without new input frames before recovery, max consecutive recoveries,
+// and new frames needed after a recovery before retries are allowed again
+#define VIP_FREEZE_WDOG_VALUE       100
+#define VIP_FREEZE_MAX_RETRIES      3
+#define VIP_FREEZE_FLOW_FRAMES      100
+
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
 #define SI_PLL_WDOG_POLL_INTERVAL   10
 #define SI_PLL_WDOG_VALUE           3
@@ -814,6 +820,48 @@ int vip_wdog_update(uint8_t framelock) {
 
     return 0;
 }
+
+void vip_stop() {
+    vip_cvi->ctrl = 0;
+    vip_dil->ctrl = 0;
+    vip_il->ctrl = 0;
+    vip_swi_pre_dil->ctrl = 0;
+    vip_swi_post_dil->ctrl = 0;
+    vip_scl_pp->ctrl = 0;
+    vip_fb->ctrl = 0;
+    vip_cvo->ctrl = 0;
+}
+
+// Detect frozen scaler input (frame buffer receives no new frames while input sync is active).
+// Unlike vip_wdog_update(), this does not depend on CVI status which may not report a valid input in this state.
+int vip_freeze_wdog_update() {
+    static uint8_t freeze_ctr = 0;
+    static uint8_t retries = 0;
+    static uint8_t flow_ctr = 0;
+    static uint32_t frame_cnt_prev = 0;
+    uint32_t frame_cnt = vip_fb->frame_cnt;
+
+    if (frame_cnt != frame_cnt_prev) {
+        freeze_ctr = 0;
+        if (flow_ctr < VIP_FREEZE_FLOW_FRAMES)
+            flow_ctr++;
+        else
+            retries = 0;
+    } else if (retries < VIP_FREEZE_MAX_RETRIES) {
+        freeze_ctr++;
+    }
+    frame_cnt_prev = frame_cnt;
+
+    if (freeze_ctr >= VIP_FREEZE_WDOG_VALUE) {
+        printf("Scaler input frozen (CVI status 0x%lx), re-initializing input\n", vip_cvi->status);
+        freeze_ctr = 0;
+        flow_ctr = 0;
+        retries++;
+        return 1;
+    }
+
+    return 0;
+}
 #endif
 
 // Reset pixel clock PLL if it does not regain lock (e.g. after input clock was disrupted during source mode change)
@@ -1276,6 +1324,18 @@ void print_vm_stats(int menu_mode) {
     sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "v%u.%.2u @ " __DATE__, FW_VER_MAJOR, FW_VER_MINOR);
     sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Uptime:");
     sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%luh %lumin", (uint32_t)((ts/TIMER_0_FREQ)/3600), ((uint32_t)((ts/TIMER_0_FREQ)/60) % 60));
+#ifdef VIP
+    // Scaler input diagnostics: CVI status and frame buffer input frame count
+    if (!enable_tp && (oper_mode == OPERMODE_SCALER)) {
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler in:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "C%lx F%lu", vip_cvi->status, vip_fb->frame_cnt);
+    }
+#endif
+    // SDP diagnostics: status registers 1, 2 and 3
+    if (enable_sdp && advsdp_dev_avail) {
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "SDP status:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%.2x %.2x %.2x", adv7280a_readreg(&advsdp_dev, 0x10), adv7280a_readreg(&advsdp_dev, 0x12), adv7280a_readreg(&advsdp_dev, 0x13));
+    }
 
     if (!menu_mode)
         osd->osd_config.status_refresh = 1;
@@ -1422,7 +1482,14 @@ void mainloop()
             break;
 
         if ((target_avinput != avinput) || force_input_reinit) {
-            force_input_reinit = 0;
+            if (force_input_reinit) {
+                // Power-cycle receivers so that they re-acquire sync from scratch (as when switching via another input)
+                adv761x_enable_power(&advrx_dev, 0);
+                adv7280a_enable_power(&advsdp_dev, 0);
+                advsdp_dev.sync_active = 0;
+                usleep(20000);
+                force_input_reinit = 0;
+            }
 
             // Force pixel clock PLL reset and full HDMI TX mode setup on next mode change
             si5351_invalidate_pll(&si_dev, SI_PLLA);
@@ -2001,6 +2068,13 @@ void mainloop()
         // Monitor if VIP DIL gets stuck or CVO fails framelocking
         if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) && (oper_mode == OPERMODE_SCALER) && vip_wdog_update(vm_conf.framelock))
             update_sc_config();
+
+        // Recover from frozen scaler input by restarting VIP and re-initializing current input
+        if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) && (oper_mode == OPERMODE_SCALER) && vip_freeze_wdog_update()) {
+            vip_stop();
+            vip_dil_hard_reset();
+            force_input_reinit = 1;
+        }
 #endif
 
         check_sdcard();
@@ -2075,14 +2149,7 @@ int main(int argc, char **argv, char **envp)
 
 #ifdef VIP
         // Disable VIP on powerdown
-        vip_cvi->ctrl = 0;
-        vip_dil->ctrl = 0;
-        vip_il->ctrl = 0;
-        vip_swi_pre_dil->ctrl = 0;
-        vip_swi_post_dil->ctrl = 0;
-        vip_scl_pp->ctrl = 0;
-        vip_fb->ctrl = 0;
-        vip_cvo->ctrl = 0;
+        vip_stop();
 #endif
 
         invalidate_loaded_arrays();
