@@ -102,6 +102,9 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 #define VIP_FREEZE_MAX_RETRIES      3
 #define VIP_FREEZE_FLOW_FRAMES      100
 
+// Input re-sync: mainloop iterations to keep VIP disabled before input re-initialization (as when switching via test pattern)
+#define RESYNC_VIP_OFF_ITERS        50
+
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
 #define SI_PLL_WDOG_POLL_INTERVAL   10
 #define SI_PLL_WDOG_VALUE           3
@@ -205,6 +208,9 @@ oper_mode_t oper_mode;
 
 avinput_t avinput, target_avinput;
 int force_input_reinit;
+int vip_force_off;
+int resync_ctr;
+unsigned resync_count;
 
 mode_data_t vmode_in, vmode_out;
 vm_proc_config_t vm_conf;
@@ -466,7 +472,7 @@ void update_sc_config()
     sl_config4_reg sl_config4 = {.data=0x00000000};
 
 #ifdef VIP
-    vip_enable = !enable_tp && (avconfig->oper_mode == 1);
+    vip_enable = !enable_tp && !vip_force_off && (avconfig->oper_mode == 1);
 
 #ifdef DEBUG
     dil_visualize_motion = avconfig->scl_dil_visualize_motion;
@@ -832,10 +838,11 @@ void vip_stop() {
     vip_cvo->ctrl = 0;
 }
 
+static uint8_t freeze_ctr = 0;
+
 // Detect frozen scaler input (frame buffer receives no new frames while input sync is active).
 // Unlike vip_wdog_update(), this does not depend on CVI status which may not report a valid input in this state.
 int vip_freeze_wdog_update() {
-    static uint8_t freeze_ctr = 0;
     static uint8_t retries = 0;
     static uint8_t flow_ctr = 0;
     static uint32_t frame_cnt_prev = 0;
@@ -863,6 +870,23 @@ int vip_freeze_wdog_update() {
     return 0;
 }
 #endif
+
+// Start re-sync of current input: keep VIP fully disabled for a while and then re-initialize input,
+// which mimics switching away to test pattern and back
+void start_input_resync() {
+    if (enable_tp || (resync_ctr > 0))
+        return;
+
+    printf("Re-syncing current input\n");
+    resync_count++;
+    resync_ctr = RESYNC_VIP_OFF_ITERS;
+#ifdef VIP
+    freeze_ctr = 0;
+    vip_force_off = 1;
+    update_sc_config();
+    vip_dil_hard_reset();
+#endif
+}
 
 // Reset pixel clock PLL if it does not regain lock (e.g. after input clock was disrupted during source mode change)
 int si_pll_wdog_update(uint8_t clkin_src) {
@@ -1175,11 +1199,9 @@ void switch_input(rc_code_t rcode, btn_code_t bcode) {
     else if (bcode == BC_DOWN)
         target_avinput = next_input;
 
-    // Re-initialize current input if its dedicated button is pressed again
-    if (((rcode == RC_BTN1) || (rcode == RC_BTN5) || (rcode == RC_BTN6)) && (target_avinput == avinput)) {
-        printf("Re-initializing current input\n");
-        force_input_reinit = 1;
-    }
+    // Re-sync current input if its dedicated button is pressed again
+    if (((rcode == RC_BTN1) || (rcode == RC_BTN5) || (rcode == RC_BTN6)) && (target_avinput == avinput))
+        start_input_resync();
 }
 
 void set_syncmux_biasmode(uint8_t syncmux_stc) {
@@ -1329,8 +1351,14 @@ void print_vm_stats(int menu_mode) {
     if (!enable_tp && (oper_mode == OPERMODE_SCALER)) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler in:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "C%lx F%lu", vip_cvi->status, vip_fb->frame_cnt);
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler out:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "V%lx O%lx", vip_fb->status, vip_cvo->status);
     }
 #endif
+    if (!enable_tp) {
+        sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u", resync_count);
+    }
     // SDP diagnostics: status registers 1, 2 and 3
     if (enable_sdp && advsdp_dev_avail) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "SDP status:");
@@ -1480,6 +1508,12 @@ void mainloop()
 
         if (!sys_powered_on)
             break;
+
+        // Finish input re-sync after VIP has been disabled long enough
+        if ((resync_ctr > 0) && (--resync_ctr == 0)) {
+            vip_force_off = 0;
+            force_input_reinit = 1;
+        }
 
         if ((target_avinput != avinput) || force_input_reinit) {
             if (force_input_reinit) {
@@ -2069,12 +2103,9 @@ void mainloop()
         if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) && (oper_mode == OPERMODE_SCALER) && vip_wdog_update(vm_conf.framelock))
             update_sc_config();
 
-        // Recover from frozen scaler input by restarting VIP and re-initializing current input
-        if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) && (oper_mode == OPERMODE_SCALER) && vip_freeze_wdog_update()) {
-            vip_stop();
-            vip_dil_hard_reset();
-            force_input_reinit = 1;
-        }
+        // Recover from frozen scaler input by re-syncing current input
+        if (((enable_isl && isl_dev.sync_active) || (enable_hdmirx && advrx_dev.sync_active) || (enable_sdp && advsdp_dev.sync_active)) && (oper_mode == OPERMODE_SCALER) && (resync_ctr == 0) && vip_freeze_wdog_update())
+            start_input_resync();
 #endif
 
         check_sdcard();

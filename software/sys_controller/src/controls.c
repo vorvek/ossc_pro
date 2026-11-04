@@ -410,6 +410,8 @@ void parse_control()
                 switch_input(r_code, b_code);
             else if ((r_code == RC_MENU) || (b_code == BC_PRESS))
                 display_menu(r_code, b_code);
+            else if (r_code == RC_OK)
+                start_input_resync();
             if (enable_tp) {
                 if ((r_code == RC_LEFT) || (b_code == BC_LEFT))
                     quick_adjust(&menu_output_items[1], -1, 1);

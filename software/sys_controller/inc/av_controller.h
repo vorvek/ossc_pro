@@ -207,6 +207,8 @@ void restart_isl(uint8_t isl_ext_range);
 
 void switch_input(rc_code_t rcode, btn_code_t bcode);
 
+void start_input_resync();
+
 void set_syncmux_biasmode(uint8_t syncmux_stc);
 
 void switch_audmux(uint8_t audmux_sel);
