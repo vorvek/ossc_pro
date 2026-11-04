@@ -1352,7 +1352,7 @@ void print_vm_stats(int menu_mode) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler in:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "C%lx F%lu", vip_cvi->status, vip_fb->frame_cnt);
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Scaler out:");
-        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "V%lx O%lx", vip_fb->status, vip_cvo->status);
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "V%lx O%lx D%lu", vip_fb->status, vip_cvo->status, vip_fb->drop_rpt_cnt);
     }
 #endif
     if (!enable_tp) {
