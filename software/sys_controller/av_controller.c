@@ -211,7 +211,6 @@ int force_input_reinit;
 int vip_force_off;
 int resync_ctr;
 unsigned resync_count;
-int emif_restart_ret;
 
 mode_data_t vmode_in, vmode_out;
 vm_proc_config_t vm_conf;
@@ -970,28 +969,6 @@ int init_emif()
     return 0;
 }
 
-// Reset LPDDR2 controller incl. multi-port front end and re-run calibration (as on powerup).
-// Frees VFB if its memory write port gets stuck.
-int emif_restart()
-{
-    int ret;
-
-    sys_ctrl &= ~(SCTRL_EMIF_HWRESET_N|SCTRL_EMIF_SWRESET_N|SCTRL_EMIF_MPFE_RESET_N);
-    IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
-    usleep(1000);
-    sys_ctrl |= SCTRL_EMIF_MPFE_RESET_N;
-    IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
-
-    ret = init_emif();
-
-    // init_emif() leaves LPDDR2 in deep powerdown
-    sys_ctrl &= ~SCTRL_EMIF_POWERDN_REQ;
-    IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
-
-    printf("EMIF restart: %d\n", ret);
-    return ret;
-}
-
 int init_sdcard() {
     int err = mmc_init(mmc_dev);
 
@@ -1380,7 +1357,7 @@ void print_vm_stats(int menu_mode) {
 #endif
     if (!enable_tp) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
-        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (EMIF %d)", resync_count, emif_restart_ret);
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u", resync_count);
     }
     // SDP diagnostics: status registers 1, 2 and 3
     if (enable_sdp && advsdp_dev_avail) {
@@ -1534,13 +1511,6 @@ void mainloop()
 
         // Finish input re-sync after VIP has been disabled long enough
         if ((resync_ctr > 0) && (--resync_ctr == 0)) {
-#ifdef VIP
-            // Restart memory controller while VIP is still disabled
-            if (oper_mode == OPERMODE_SCALER) {
-                emif_restart_ret = emif_restart();
-                vip_dil_hard_reset();
-            }
-#endif
             vip_force_off = 0;
             force_input_reinit = 1;
         }
