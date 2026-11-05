@@ -103,9 +103,8 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 #define VIP_FREEZE_FLOW_FRAMES      100
 
 // Input re-sync: mainloop iterations to stay in test pattern before switching back to the original input
-// (multiplied by the freeze watchdog retry number), and the retry number from which the scaler is also hard-reset
+// (multiplied by the freeze watchdog retry number)
 #define RESYNC_TP_ITERS             100
-#define RESYNC_HARD_RESET_RETRY     2
 
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
 #define SI_PLL_WDOG_POLL_INTERVAL   10
@@ -209,7 +208,7 @@ int enable_isl, enable_hdmirx, enable_sdp, enable_tp;
 oper_mode_t oper_mode;
 
 avinput_t avinput, target_avinput;
-int resync_ctr, resync_returning, resync_hard;
+int resync_ctr, resync_returning;
 avinput_t resync_return_input;
 unsigned resync_count;
 unsigned vip_reset_count;
@@ -881,6 +880,7 @@ int vip_freeze_wdog_update() {
 
 // Start re-sync of current input by switching to test pattern and back after a while. Test pattern mode disables VIP
 // and drives the pixel clock from XTAL, so VIP clocks keep running while the pipeline stops (unlike when input is lost).
+// The scaler is hard-reset at the end of the test pattern period.
 void start_input_resync() {
     int hold_mult = 1;
 
@@ -892,8 +892,6 @@ void start_input_resync() {
     // Stay longer in test pattern on each consecutive freeze watchdog retry (1s, 2s, ...)
     if (freeze_retries > 1)
         hold_mult = freeze_retries;
-    // A plain round trip does not always free the scaler, so reset it as well on later retries
-    resync_hard = (freeze_retries >= RESYNC_HARD_RESET_RETRY);
 #endif
 
     printf("Re-syncing current input via test pattern\n");
@@ -1566,11 +1564,10 @@ void mainloop()
         // Finish input re-sync by returning from test pattern, unless another input was selected meanwhile
         if ((resync_ctr > 0) && (--resync_ctr == 0) && (target_avinput == AV_TESTPAT)) {
 #ifdef VIP
-            // Scaler is stopped and pixel clock comes from XTAL at this point
-            if (resync_hard) {
-                vip_reset_ret = vip_hard_reset();
-                vip_reset_count++;
-            }
+            // A plain round trip rarely frees a frozen scaler, so reset it as well.
+            // Scaler is stopped and pixel clock comes from XTAL at this point.
+            vip_reset_ret = vip_hard_reset();
+            vip_reset_count++;
 #endif
             target_avinput = resync_return_input;
             resync_returning = 1;
