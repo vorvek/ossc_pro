@@ -96,13 +96,14 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 
 #define VIP_WDOG_VALUE 10
 
-// Scaler input freeze watchdog: mainloop iterations without new input frames before recovery, max consecutive recoveries,
-// and new frames needed after a recovery before retries are allowed again
+// Scaler input freeze watchdog: mainloop iterations without new input frames before recovery (multiplied by the
+// number of the next retry), max consecutive recoveries, and new frames needed after a recovery before retries are allowed again
 #define VIP_FREEZE_WDOG_VALUE       100
-#define VIP_FREEZE_MAX_RETRIES      3
+#define VIP_FREEZE_MAX_RETRIES      5
 #define VIP_FREEZE_FLOW_FRAMES      100
 
 // Input re-sync: mainloop iterations to stay in test pattern before switching back to the original input
+// (multiplied by the freeze watchdog retry number)
 #define RESYNC_TP_ITERS             100
 
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
@@ -841,7 +842,7 @@ void vip_stop() {
     vip_cvo->ctrl = 0;
 }
 
-static uint8_t freeze_ctr = 0;
+static uint16_t freeze_ctr = 0;
 static uint8_t freeze_retries = 0;
 
 // Detect frozen scaler input (frame buffer receives no new frames while input sync is active).
@@ -862,7 +863,8 @@ int vip_freeze_wdog_update() {
     }
     frame_cnt_prev = frame_cnt;
 
-    if (freeze_ctr >= VIP_FREEZE_WDOG_VALUE) {
+    // Wait longer after each failed recovery to give the source and the receiver more time to settle
+    if (freeze_ctr >= VIP_FREEZE_WDOG_VALUE*(freeze_retries+1)) {
         printf("Scaler input frozen (CVI status 0x%lx), re-initializing input\n", vip_cvi->status);
         freeze_ctr = 0;
         flow_ctr = 0;
@@ -877,17 +879,23 @@ int vip_freeze_wdog_update() {
 // Start re-sync of current input by switching to test pattern and back after a while. Test pattern mode disables VIP
 // and drives the pixel clock from XTAL, so VIP clocks keep running while the pipeline stops (unlike when input is lost).
 void start_input_resync() {
+    int hold_mult = 1;
+
     if (enable_tp || (resync_ctr > 0))
         return;
+
+#ifdef VIP
+    freeze_ctr = 0;
+    // Stay longer in test pattern on each consecutive freeze watchdog retry (1s, 2s, ...)
+    if (freeze_retries > 1)
+        hold_mult = freeze_retries;
+#endif
 
     printf("Re-syncing current input via test pattern\n");
     resync_count++;
     resync_return_input = avinput;
     target_avinput = AV_TESTPAT;
-    resync_ctr = RESYNC_TP_ITERS;
-#ifdef VIP
-    freeze_ctr = 0;
-#endif
+    resync_ctr = RESYNC_TP_ITERS*hold_mult;
 }
 
 // Monitor pixel clock PLL lock. Observe only: resetting PLLA under a live pixel clock interrupts the CVO / HDMI TX
