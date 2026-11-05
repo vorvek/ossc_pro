@@ -1008,8 +1008,7 @@ int vip_hard_reset()
 
     scl_loaded_pp_coeff = -1;
 
-    printf("VIP hard reset: %d
-", ret);
+    printf("VIP hard reset: %d\n", ret);
     return ret;
 }
 #endif
