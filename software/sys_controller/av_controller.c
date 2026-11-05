@@ -102,8 +102,9 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 #define VIP_FREEZE_MAX_RETRIES      5
 #define VIP_FREEZE_FLOW_FRAMES      100
 
-// Input re-sync: mainloop iterations to stay in test pattern before switching back to the original input
-// (multiplied by the freeze watchdog retry number)
+// Input re-sync: freeze watchdog retries which reset the scaler in place, and mainloop iterations to stay in test pattern
+// before switching back to the original input on the retries after those (multiplied by the number of the retry)
+#define RESYNC_DIRECT_RETRIES       2
 #define RESYNC_TP_ITERS             100
 
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
@@ -847,6 +848,8 @@ void vip_stop() {
 static uint16_t freeze_ctr = 0;
 static uint8_t freeze_retries = 0;
 
+int vip_hard_reset();
+
 // Detect frozen scaler input (frame buffer receives no new frames while input sync is active).
 // Unlike vip_wdog_update(), this does not depend on CVI status which may not report a valid input in this state.
 int vip_freeze_wdog_update() {
@@ -878,9 +881,10 @@ int vip_freeze_wdog_update() {
 }
 #endif
 
-// Start re-sync of current input by switching to test pattern and back after a while. Test pattern mode disables VIP
-// and drives the pixel clock from XTAL, so VIP clocks keep running while the pipeline stops (unlike when input is lost).
-// The scaler is hard-reset at the end of the test pattern period.
+// Start re-sync of current input. In scaler mode, first hard-reset the scaler in place. If that does not help (or in
+// other modes), switch to test pattern and back after a while with a scaler hard reset at the end of the test pattern
+// period. Test pattern mode disables VIP and drives the pixel clock from XTAL, so VIP clocks keep running while the
+// pipeline stops (unlike when input is lost).
 void start_input_resync() {
     int hold_mult = 1;
 
@@ -889,9 +893,15 @@ void start_input_resync() {
 
 #ifdef VIP
     freeze_ctr = 0;
+    if ((oper_mode == OPERMODE_SCALER) && (freeze_retries <= RESYNC_DIRECT_RETRIES)) {
+        vip_reset_ret = vip_hard_reset();
+        vip_reset_count++;
+        update_sc_config();
+        return;
+    }
     // Stay longer in test pattern on each consecutive freeze watchdog retry (1s, 2s, ...)
-    if (freeze_retries > 1)
-        hold_mult = freeze_retries;
+    if (freeze_retries > RESYNC_DIRECT_RETRIES+1)
+        hold_mult = freeze_retries-RESYNC_DIRECT_RETRIES;
 #endif
 
     printf("Re-syncing current input via test pattern\n");
