@@ -103,8 +103,9 @@ const uint8_t fw_ver_major = FW_VER_MAJOR, fw_ver_minor = FW_VER_MINOR;
 #define VIP_FREEZE_FLOW_FRAMES      100
 
 // Input re-sync: mainloop iterations to stay in test pattern before switching back to the original input
-// (multiplied by the freeze watchdog retry number)
+// (multiplied by the freeze watchdog retry number), and the retry number from which the scaler is also hard-reset
 #define RESYNC_TP_ITERS             100
+#define RESYNC_HARD_RESET_RETRY     2
 
 // Si5351 PLL lock watchdog: poll interval (in mainloop iterations), consecutive unlocked polls before reset, and polls to wait after reset
 #define SI_PLL_WDOG_POLL_INTERVAL   10
@@ -208,9 +209,11 @@ int enable_isl, enable_hdmirx, enable_sdp, enable_tp;
 oper_mode_t oper_mode;
 
 avinput_t avinput, target_avinput;
-int resync_ctr, resync_returning;
+int resync_ctr, resync_returning, resync_hard;
 avinput_t resync_return_input;
 unsigned resync_count;
+unsigned vip_reset_count;
+int vip_reset_ret;
 unsigned pll_lol_count;
 unsigned vip_route_changes;
 uint8_t pll_last_status;
@@ -889,6 +892,8 @@ void start_input_resync() {
     // Stay longer in test pattern on each consecutive freeze watchdog retry (1s, 2s, ...)
     if (freeze_retries > 1)
         hold_mult = freeze_retries;
+    // A plain round trip does not always free the scaler, so reset it as well on later retries
+    resync_hard = (freeze_retries >= RESYNC_HARD_RESET_RETRY);
 #endif
 
     printf("Re-syncing current input via test pattern\n");
@@ -935,7 +940,7 @@ int si_pll_wdog_update(uint8_t clkin_src) {
     return 0;
 }
 
-int init_emif()
+int init_emif(int enter_powerdn)
 {
     alt_timestamp_type start_ts;
 
@@ -965,6 +970,9 @@ int init_emif()
         return -3;
     }
 
+    if (!enter_powerdn)
+        return 0;
+
     // Place LPDDR2 into deep powerdown mode (occasionally fails on some boards for unknown reason)
     sys_ctrl |= (SCTRL_EMIF_POWERDN_REQ);
     IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
@@ -980,6 +988,31 @@ int init_emif()
 
     return 0;
 }
+
+#ifdef VIP
+// Reset all VIP cores and the LPDDR2 controller, and re-run memory calibration. The MPFE reset line also resets the
+// VIP cores, so this is what a standby cycle does to the scaler. All VIP registers must be rewritten afterwards.
+int vip_hard_reset()
+{
+    int ret;
+
+    vip_stop();
+
+    sys_ctrl &= ~(SCTRL_EMIF_HWRESET_N|SCTRL_EMIF_SWRESET_N|SCTRL_EMIF_MPFE_RESET_N|SCTRL_VIP_DIL_RESET_N);
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
+    usleep(100000);
+    sys_ctrl |= SCTRL_EMIF_MPFE_RESET_N|SCTRL_VIP_DIL_RESET_N;
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_0_BASE, sys_ctrl);
+
+    ret = init_emif(0);
+
+    scl_loaded_pp_coeff = -1;
+
+    printf("VIP hard reset: %d
+", ret);
+    return ret;
+}
+#endif
 
 int init_sdcard() {
     int err = mmc_init(mmc_dev);
@@ -1088,7 +1121,7 @@ int init_hw()
     }
 
     // Init LPDDR2 interface
-    ret = init_emif();
+    ret = init_emif(1);
     if (ret != 0) {
         sniprintf(row1, US2066_ROW_LEN+1, "EMIF init fail");
         return ret;
@@ -1377,7 +1410,7 @@ void print_vm_stats(int menu_mode) {
 #endif
     if (!enable_tp) {
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "Re-syncs:");
-        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (routes %u)", resync_count, vip_route_changes);
+        sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u/%u E%d R%u", resync_count, vip_reset_count, vip_reset_ret, vip_route_changes);
         sniprintf((char*)osd->osd_array.data[++row][0], OSD_CHAR_COLS, "PLL LOL events:");
         sniprintf((char*)osd->osd_array.data[row][1], OSD_CHAR_COLS, "%u (st %.2x)", pll_lol_count, pll_last_status);
     }
@@ -1533,6 +1566,13 @@ void mainloop()
 
         // Finish input re-sync by returning from test pattern, unless another input was selected meanwhile
         if ((resync_ctr > 0) && (--resync_ctr == 0) && (target_avinput == AV_TESTPAT)) {
+#ifdef VIP
+            // Scaler is stopped and pixel clock comes from XTAL at this point
+            if (resync_hard) {
+                vip_reset_ret = vip_hard_reset();
+                vip_reset_count++;
+            }
+#endif
             target_avinput = resync_return_input;
             resync_returning = 1;
         }
